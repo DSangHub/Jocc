@@ -1,0 +1,145 @@
+Full schema. Tables are prefixed jocc_ because this Supabase project is
+-- shared with other apps.
+
+create table if not exists public.jocc_profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  display_name text,
+  city text,
+  county text,
+  zip_code text,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.jocc_clubs (
+  id uuid primary key default gen_random_uuid(),
+  slug text not null unique,
+  name text not null check (char_length(name) between 2 and 60),
+  blurb text not null default '' check (char_length(blurb) <= 160),
+  description text not null default '',
+  category text not null check (category in
+    ('nature','auto','sewing','knitting','quilting','baking','garden','books','music','fishing')),
+  meeting_note text,
+  created_by uuid references auth.users(id) on delete set null,
+  zip_code text, city text, county text, state text,
+  latitude numeric(10,7), longitude numeric(10,7),
+  is_verified boolean not null default false,
+  created_at timestamptz not null default now()
+);
+create index if not exists jocc_clubs_category_idx on public.jocc_clubs(category);
+create index if not exists jocc_clubs_county_idx on public.jocc_clubs(county);
+
+create table if not exists public.jocc_club_members (
+  club_id uuid not null references public.jocc_clubs(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  role text not null default 'member' check (role in ('member','steward')),
+  joined_at timestamptz not null default now(),
+  primary key (club_id, user_id)
+);
+create index if not exists jocc_members_user_idx on public.jocc_club_members(user_id);
+
+create table if not exists public.jocc_messages (
+  id uuid primary key default gen_random_uuid(),
+  club_id uuid not null references public.jocc_clubs(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  body text not null check (char_length(body) between 1 and 1000),
+  created_at timestamptz not null default now()
+);
+create index if not exists jocc_messages_club_idx on public.jocc_messages(club_id, created_at desc);
+
+create table if not exists public.jocc_badges (
+  user_id uuid not null references auth.users(id) on delete cascade,
+  badge_type text not null,
+  awarded_at timestamptz not null default now(),
+  primary key (user_id, badge_type)
+);
+
+-- Membership test used by the message policies. SECURITY DEFINER so the
+-- policy on jocc_messages does not recurse through jocc_club_members.
+create or replace function public.jocc_is_member(p_club_id uuid, p_user_id uuid)
+returns boolean language sql security definer stable set search_path = public as $$
+  select exists (select 1 from public.jocc_club_members m
+                 where m.club_id = p_club_id and m.user_id = p_user_id);
+$$;
+revoke execute on function public.jocc_is_member(uuid, uuid) from public, anon;
+grant execute on function public.jocc_is_member(uuid, uuid) to authenticated;
+
+alter table public.jocc_profiles     enable row level security;
+alter table public.jocc_clubs        enable row level security;
+alter table public.jocc_club_members enable row level security;
+alter table public.jocc_messages     enable row level security;
+alter table public.jocc_badges       enable row level security;
+
+-- Profiles: public read, self write
+create policy jocc_profiles_read   on public.jocc_profiles for select to anon, authenticated using (true);
+create policy jocc_profiles_upsert on public.jocc_profiles for insert to authenticated with check (id = auth.uid());
+create policy jocc_profiles_update on public.jocc_profiles for update to authenticated using (id = auth.uid()) with check (id = auth.uid());
+
+-- Clubs: public directory, owner-managed
+create policy jocc_clubs_read   on public.jocc_clubs for select to anon, authenticated using (true);
+create policy jocc_clubs_insert on public.jocc_clubs for insert to authenticated with check (created_by = auth.uid());
+create policy jocc_clubs_update on public.jocc_clubs for update to authenticated using (created_by = auth.uid()) with check (created_by = auth.uid());
+create policy jocc_clubs_delete on public.jocc_clubs for delete to authenticated using (created_by = auth.uid());
+
+-- Members: roster public (drives the counts), you manage only your own row
+create policy jocc_members_read  on public.jocc_club_members for select to anon, authenticated using (true);
+create policy jocc_members_join  on public.jocc_club_members for insert to authenticated with check (user_id = auth.uid());
+create policy jocc_members_leave on public.jocc_club_members for delete to authenticated using (user_id = auth.uid());
+
+-- Messages: members only, read and write
+create policy jocc_messages_read   on public.jocc_messages for select to authenticated
+  using (public.jocc_is_member(club_id, auth.uid()));
+create policy jocc_messages_write  on public.jocc_messages for insert to authenticated
+  with check (user_id = auth.uid() and public.jocc_is_member(club_id, auth.uid()));
+create policy jocc_messages_delete on public.jocc_messages for delete to authenticated using (user_id = auth.uid());
+
+-- Badges: public read, awarded only through the function below
+create policy jocc_badges_read on public.jocc_badges for select to anon, authenticated using (true);
+
+-- Realtime club chat
+alter table public.jocc_messages replica identity full;
+do $$
+begin
+  if not exists (select 1 from pg_publication_tables
+                 where pubname = 'supabase_realtime' and schemaname = 'public'
+                   and tablename = 'jocc_messages') then
+    execute 'alter publication supabase_realtime add table public.jocc_messages';
+  end if;
+end $$;
+
+create or replace function public.jocc_award_badge(p_badge_type text)
+returns boolean language plpgsql security definer set search_path = public as $$
+begin
+  if auth.uid() is null then return false; end if;
+  insert into public.jocc_badges (user_id, badge_type) values (auth.uid(), p_badge_type)
+  on conflict (user_id, badge_type) do nothing;
+  return found;
+end $$;
+revoke execute on function public.jocc_award_badge(text) from public, anon;
+grant execute on function public.jocc_award_badge(text) to authenticated;
+
+-- Clubs within a radius, haversine in km
+create or replace function public.jocc_clubs_near(p_lat numeric, p_lng numeric, p_radius_km numeric default 80)
+returns table (id uuid, slug text, name text, blurb text, category text,
+               city text, county text, state text, is_verified boolean,
+               member_count bigint, distance_km numeric)
+language sql stable set search_path = public as $$
+  select c.id, c.slug, c.name, c.blurb, c.category, c.city, c.county, c.state, c.is_verified,
+         (select count(*) from public.jocc_club_members m where m.club_id = c.id),
+         round((6371 * acos(least(1, cos(radians(p_lat)) * cos(radians(c.latitude)) *
+                cos(radians(c.longitude) - radians(p_lng)) +
+                sin(radians(p_lat)) * sin(radians(c.latitude)))))::numeric, 1)
+  from public.jocc_clubs c
+  where c.latitude is not null and c.longitude is not null
+    and (6371 * acos(least(1, cos(radians(p_lat)) * cos(radians(c.latitude)) *
+         cos(radians(c.longitude) - radians(p_lng)) +
+         sin(radians(p_lat)) * sin(radians(c.latitude))))) <= p_radius_km
+  order by 11 asc;
+$$;
+revoke execute on function public.jocc_clubs_near(numeric, numeric, numeric) from public;
+grant execute on function public.jocc_clubs_near(numeric, numeric, numeric) to anon, authenticated;
+
+-- Directory listing with member counts
+create or replace view public.jocc_club_directory with (security_invoker = on) as
+select c.*, (select count(*) from public.jocc_club_members m where m.club_id = c.id) as member_count
+from public.jocc_clubs c;
+grant select on public.jocc_club_directory to anon, authenticated;
