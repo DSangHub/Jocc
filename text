@@ -1,0 +1,11 @@
+User signs in (Google, Facebook, email, etc.)
+         ↓
+Supabase verifies identity with external provider
+         ↓
+Supabase issues JWT
+         ↓
+JWT contains user ID and any custom claims (roles, permissions)
+         ↓
+Database RLS policies check JWT for every request
+         ↓
+User can only access data they're authorized for
