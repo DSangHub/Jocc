@@ -1,0 +1,12 @@
+CREATE OR REPLACE FUNCTION award_verification_badge(
+  p_user_id UUID,
+  p_badge_type TEXT
+)
+RETURNS BOOLEAN AS $$
+BEGIN
+  INSERT INTO user_badges (user_id, badge_type, awarded_at)
+  VALUES (p_user_id, p_badge_type, now())
+  ON CONFLICT (user_id, badge_type) DO NOTHING;
+  RETURN FOUND;
+END;
+$$ LANGUAGE plpgsql;
