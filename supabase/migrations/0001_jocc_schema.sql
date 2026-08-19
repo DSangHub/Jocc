@@ -1,4 +1,5 @@
-Full schema. Tables are prefixed jocc_ because this Supabase project is
+-- JOCC — Join Online Country Clubs
+-- Full schema. Tables are prefixed jocc_ because this Supabase project is
 -- shared with other apps.
 
 create table if not exists public.jocc_profiles (
